@@ -1,0 +1,67 @@
+// Prisma schema — DBのテーブル定義をここに書く
+// `npx prisma migrate dev` を実行すると:
+//   1. このschemaとDBの差分からSQLマイグレーションファイルを prisma/migrations/ に生成
+//   2. SQLite DB (prisma/dev.db) に適用
+//   3. `npx prisma generate` が自動実行され、型安全なクライアント (@prisma/client) を生成
+// 生成されたクライアントは `import { PrismaClient } from "@prisma/client"` で使う
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL") // .env の DATABASE_URL="file:./dev.db" を参照
+}
+
+// 学習対象の単語・フレーズ
+model Word {
+  id         Int         @id @default(autoincrement())
+  term       String // 英単語・フレーズ
+  meaning    String // 日本語の意味
+  example    String? // 例文(任意)
+  category   String // "general" | "programming" | "git" | "error" | "comment" | "reading"
+  source     String // "seed"(初期データ) | "reading"(記事から登録)
+  // SRS(間隔反復)の状態。SM-2アルゴリズムで更新する
+  easeFactor Float       @default(2.5) // 記憶のしやすさ係数(SM-2)
+  interval   Int         @default(0) // 次回復習までの日数
+  repetition Int         @default(0) // 連続正解回数
+  nextReviewAt DateTime  @default(now()) // 次に出題すべき日時
+  createdAt  DateTime    @default(now())
+  reviewLogs ReviewLog[]
+}
+
+// 復習1回ごとの記録(ダッシュボードの集計に使う)
+model ReviewLog {
+  id           Int      @id @default(autoincrement())
+  wordId       Int
+  word         Word     @relation(fields: [wordId], references: [id], onDelete: Cascade)
+  correct      Boolean
+  reviewedAt   DateTime @default(now())
+  nextReviewAt DateTime
+}
+
+// 記事リーダーでの1回の閲覧セッション
+model ReadingSession {
+  id           Int      @id @default(autoincrement())
+  articleTitle String?
+  articleUrl   String? // 出典URL(NewsAPI取得記事の場合)
+  sourceName   String? // 出典元(例: "TechCrunch")
+  charCount    Int
+  tappedWords  Int      @default(0)
+  createdAt    DateTime @default(now())
+  quizzes      Quiz[]
+}
+
+// 記事から生成した読解クイズ(4択 or 穴埋め)
+model Quiz {
+  id               Int            @id @default(autoincrement())
+  readingSessionId Int
+  session          ReadingSession @relation(fields: [readingSessionId], references: [id], onDelete: Cascade)
+  question         String
+  choices          String // SQLiteに配列型がないため選択肢はJSON文字列で保存
+  answerIndex      Int
+  explanation      String?
+  answeredCorrect  Boolean? // 未回答はnull
+  createdAt        DateTime       @default(now())
+}
