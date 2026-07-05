@@ -41,9 +41,56 @@ export async function generateFromArticle(
 
 // ===== AI経路 =====
 // SDKを追加せず標準fetchでAnthropic Messages APIを直接呼ぶ(依存を最小にするため)
+
+// モデルと思考の深さ(effort)は環境変数で差し替え可能。
+// デフォルトは Sonnet 5 + xhigh: アダプティブ思考と組み合わせることで
+// Sonnet 5 から最大限の品質(上位モデルに迫る出力)を引き出す構成。
+// 注意: effort / adaptive thinking は Sonnet 5 / Opus 4.6+ / Fable 5 系で有効。
+//       Haiku 4.5 など旧方式のモデルを CLAUDE_MODEL に指定するとAPIエラーになる
+//       (その場合も簡易ロジックへフォールバックするため学習は止まらない)。
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-5";
+const CLAUDE_EFFORT = process.env.CLAUDE_EFFORT || "xhigh"; // low | medium | high | xhigh | max
+
+// 構造化出力(json_schema)でレスポンス形式をAPIレベルで強制する。
+// プロンプト指示だけに頼るより堅牢で、コードフェンス混入やJSON崩れが起きない。
+const OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    quizzes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          question: { type: "string" },
+          choices: { type: "array", items: { type: "string" } },
+          answerIndex: { type: "integer", enum: [0, 1, 2, 3] },
+          explanation: { type: "string" },
+        },
+        required: ["question", "choices", "answerIndex", "explanation"],
+        additionalProperties: false,
+      },
+    },
+    vocabulary: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          term: { type: "string" },
+          meaning: { type: "string" },
+          example: { type: "string" },
+        },
+        required: ["term", "meaning"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["quizzes", "vocabulary"],
+  additionalProperties: false,
+} as const;
+
 async function generateWithAI(title: string, text: string): Promise<GeneratedContent> {
-  const prompt = `You are an English learning assistant for a Japanese programmer.
-Read the following English article and produce learning material.
+  const prompt = `You are an expert English learning material designer for a Japanese programmer.
+Read the following English article and produce high-quality learning material.
 
 Article title: ${title}
 Article text:
@@ -52,11 +99,11 @@ ${text.slice(0, 6000)}
 """
 
 Produce:
-1. "quizzes": 3-5 multiple-choice reading comprehension questions about the article. Each has "question" (English), "choices" (array of exactly 4 English strings), "answerIndex" (0-3), "explanation" (short explanation in Japanese).
-2. "vocabulary": about 10 important English words or expressions from the article that are useful for a Japanese engineer. Each has "term", "meaning" (Japanese), "example" (a short English example sentence, ideally from the article).
-
-Respond with ONLY a raw JSON object: {"quizzes": [...], "vocabulary": [...]}
-No preamble, no markdown code fences, no trailing commentary.`;
+1. "quizzes": 3-5 multiple-choice reading comprehension questions about the article. Each has "question" (English), "choices" (array of exactly 4 English strings), "answerIndex" (0-3), "explanation" (explanation in Japanese that teaches why the answer is correct and where in the article it is supported).
+   - Make distractors plausible: they should be wrong for a specific reason (e.g. contradicted by the article, or true but not what the question asks), not obviously absurd.
+   - Cover different parts and aspects of the article rather than asking about the same paragraph repeatedly.
+2. "vocabulary": about 10 important English words or expressions from the article that are genuinely useful for a Japanese engineer. Each has "term", "meaning" (natural Japanese), "example" (a short English example sentence, ideally quoted from the article).
+   - Prefer words/expressions the reader is likely to encounter again in technical or business English; skip trivial words.`;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -66,8 +113,15 @@ No preamble, no markdown code fences, no trailing commentary.`;
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001", // 低コストな軽量モデルで十分な品質が出る
-      max_tokens: 3000,
+      model: CLAUDE_MODEL,
+      // 思考(thinking)トークンも max_tokens に含まれるため、xhigh でも
+      // 途中で切れないよう余裕を持たせる
+      max_tokens: 16000,
+      thinking: { type: "adaptive" }, // モデルが必要に応じて深く考える
+      output_config: {
+        effort: CLAUDE_EFFORT,
+        format: { type: "json_schema", schema: OUTPUT_SCHEMA },
+      },
       messages: [{ role: "user", content: prompt }],
     }),
   });
@@ -78,9 +132,15 @@ No preamble, no markdown code fences, no trailing commentary.`;
   }
 
   const data = await res.json();
-  let raw: string = data.content?.[0]?.text ?? "";
-  // 指示していてもコードフェンス付きで返る場合があるため保険として剥がす
-  raw = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+  // セーフティ分類器による拒否(refusal)はHTTP 200で返るため明示的に検出する
+  if (data.stop_reason === "refusal") {
+    throw new Error("Anthropic API refused the request");
+  }
+  // アダプティブ思考有効時は thinking ブロックが先頭に来るため、text ブロックを探す
+  const raw: string =
+    (data.content as { type: string; text?: string }[] | undefined)?.find(
+      (b) => b.type === "text"
+    )?.text ?? "";
   // AIの出力はスキーマ通りとは限らないため、unknownとして受けて検証しながら取り込む
   type RawQuiz = { question?: unknown; choices?: unknown; answerIndex?: unknown; explanation?: unknown };
   type RawVocab = { term?: unknown; meaning?: unknown; example?: unknown };
